@@ -1,34 +1,43 @@
-// Copyright The OpenTelemetry Authors
-// SPDX-License-Identifier: Apache-2.0
-
-// Based on https://github.com/DataDog/dd-trace-go/blob/8fb554ff7cf694267f9077ae35e27ce4689ed8b6/contrib/gin-gonic/gin/gintrace.go
-
-package otelgin // import "go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
+package otelgin
 
 import (
-	"fmt"
-
+	"context"
 	"github.com/gin-gonic/gin"
-
-	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin/internal/semconvutil"
+	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc" // 引入gRPC导出器
+	"go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/log"
 	semconv "go.opentelemetry.io/otel/semconv/v1.20.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 const (
-	tracerKey = "otel-go-contrib-tracer"
-	// ScopeName is the instrumentation scope name.
-	ScopeName = "go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
+	tracerKey = "笑死了"
+	ScopeName = "otelgin"
 )
 
-// Middleware returns middleware that will trace incoming requests.
-// The service parameter should describe the name of the (virtual)
-// server handling the request.
 func Middleware(service string, opts ...Option) gin.HandlerFunc {
+	ctx := context.Background()
+
+	// 初始化 gRPC 日志导出器
+	logExporter, err := otlploggrpc.New(ctx, otlploggrpc.WithInsecure())
+	if err != nil {
+		panic("无法初始化 gRPC 日志导出器")
+	}
+
+	lp := log.NewLoggerProvider(
+		log.WithProcessor(
+			log.NewBatchProcessor(logExporter),
+		),
+	)
+	defer lp.Shutdown(ctx)
+	global.SetLoggerProvider(lp)
+
+	logger := otelslog.NewLogger(tracerKey)
+
 	cfg := config{}
 	for _, opt := range opts {
 		opt.apply(&cfg)
@@ -43,19 +52,16 @@ func Middleware(service string, opts ...Option) gin.HandlerFunc {
 	if cfg.Propagators == nil {
 		cfg.Propagators = otel.GetTextMapPropagator()
 	}
+
 	return func(c *gin.Context) {
 		for _, f := range cfg.Filters {
 			if !f(c.Request) {
-				// Serve the request to the next middleware
-				// if a filter rejects the request.
 				c.Next()
 				return
 			}
 		}
 		for _, f := range cfg.GinFilters {
 			if !f(c) {
-				// Serve the request to the next middleware
-				// if a filter rejects the request.
 				c.Next()
 				return
 			}
@@ -67,70 +73,34 @@ func Middleware(service string, opts ...Option) gin.HandlerFunc {
 		}()
 		ctx := cfg.Propagators.Extract(savedCtx, propagation.HeaderCarrier(c.Request.Header))
 		opts := []oteltrace.SpanStartOption{
-			oteltrace.WithAttributes(semconvutil.HTTPServerRequest(service, c.Request)...),
-			oteltrace.WithAttributes(semconv.HTTPRoute(c.FullPath())),
+			oteltrace.WithAttributes(
+				semconv.HTTPMethodKey.String(c.Request.Method),
+				semconv.HTTPTargetKey.String(c.Request.URL.Path),
+				semconv.HTTPClientIPKey.String(c.ClientIP()),
+			),
 			oteltrace.WithSpanKind(oteltrace.SpanKindServer),
 		}
-		var spanName string
-		if cfg.SpanNameFormatter == nil {
-			spanName = c.FullPath()
-		} else {
-			spanName = cfg.SpanNameFormatter(c.Request)
-		}
-		if spanName == "" {
-			spanName = fmt.Sprintf("HTTP %s route not found", c.Request.Method)
-		}
+		spanName := c.FullPath()
 		ctx, span := tracer.Start(ctx, spanName, opts...)
 		defer span.End()
 
-		// pass the span through the request context
+		// 将追踪 ID 和 span ID 添加到日志中
+		traceID := span.SpanContext().TraceID().String()
+		spanID := span.SpanContext().SpanID().String()
+		logger.With("traceID", traceID, "spanID", spanID).Debug("收到请求: ", c.Request.Method, " ", c.FullPath())
+
 		c.Request = c.Request.WithContext(ctx)
 
-		// serve the request to the next middleware
 		c.Next()
 
 		status := c.Writer.Status()
-		span.SetStatus(semconvutil.HTTPServerStatus(status))
 		if status > 0 {
 			span.SetAttributes(semconv.HTTPStatusCode(status))
 		}
 		if len(c.Errors) > 0 {
 			span.SetAttributes(attribute.String("gin.errors", c.Errors.String()))
+			logger.With("traceID", traceID, "spanID", spanID).Error("请求出错: ", c.Errors.String())
 		}
+		logger.With("traceID", traceID, "spanID", spanID, "status", status).Info("请求完成: ", c.Request.Method, " ", c.FullPath())
 	}
-}
-
-// HTML will trace the rendering of the template as a child of the
-// span in the given context. This is a replacement for
-// gin.Context.HTML function - it invokes the original function after
-// setting up the span.
-func HTML(c *gin.Context, code int, name string, obj interface{}) {
-	var tracer oteltrace.Tracer
-	tracerInterface, ok := c.Get(tracerKey)
-	if ok {
-		tracer, ok = tracerInterface.(oteltrace.Tracer)
-	}
-	if !ok {
-		tracer = otel.GetTracerProvider().Tracer(
-			ScopeName,
-			oteltrace.WithInstrumentationVersion(Version()),
-		)
-	}
-	savedContext := c.Request.Context()
-	defer func() {
-		c.Request = c.Request.WithContext(savedContext)
-	}()
-	opt := oteltrace.WithAttributes(attribute.String("go.template", name))
-	_, span := tracer.Start(savedContext, "gin.renderer.html", opt)
-	defer func() {
-		if r := recover(); r != nil {
-			err := fmt.Errorf("error rendering template:%s: %s", name, r)
-			span.RecordError(err)
-			span.SetStatus(codes.Error, "template failure")
-			span.End()
-			panic(r)
-		}
-		span.End()
-	}()
-	c.HTML(code, name, obj)
 }
