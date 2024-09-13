@@ -1,4 +1,4 @@
-module go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin
+module github.com/Wudadada/opentelemetry-go-contrib/instrumentation/github.com/gin-gonic/gin/otelgin
 
 go 1.22
 
