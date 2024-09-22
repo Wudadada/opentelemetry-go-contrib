@@ -74,9 +74,11 @@ func Middleware(service string, opts ...Option) gin.HandlerFunc {
 		ctx := cfg.Propagators.Extract(savedCtx, propagation.HeaderCarrier(c.Request.Header))
 		opts := []oteltrace.SpanStartOption{
 			oteltrace.WithAttributes(
-				semconv.HTTPMethodKey.String(c.Request.Method),
-				semconv.HTTPTargetKey.String(c.Request.URL.Path),
-				semconv.HTTPClientIPKey.String(c.ClientIP()),
+				semconv.ServiceNameKey.String(service),
+				semconv.RPCSystemKey.String("grpc"),           // 使用 gRPC 系统
+				semconv.RPCServiceKey.String(service),         // 服务名称
+				semconv.RPCMethodKey.String(c.Request.Method), // gRPC 方法名称
+				semconv.NetPeerNameKey.String(c.Request.Host), // 对端的主机名
 			),
 			oteltrace.WithSpanKind(oteltrace.SpanKindServer),
 		}
